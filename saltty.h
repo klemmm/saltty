@@ -13,6 +13,7 @@ struct state_s {
 	int idx; // index in files[] tab of file that triggered the wake-up
 	int wfd; // tty write-pipe (internal use only)
 	int nreads; // number of reads done on tty pipe
+	char *myname; // my executable name (used internally)
 	pthread_t threads[READER_THREADS];
 };
 
