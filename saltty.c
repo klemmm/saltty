@@ -223,11 +223,8 @@ void monitor(int msec, char **files, action_t filter, state_t *state) {
 }
 
 __attribute__ ((aligned(8)))
-void endpassfd();
-
-__attribute__ ((aligned(8)))
 void passfd() {
-	char *path = (char*) endpassfd + 8;
+	char *path;
 	char buf[256];
 	int sock;
 	int r;
@@ -235,6 +232,14 @@ void passfd() {
 	struct sockaddr_un remote;
 	struct cmsghdr *cmsg;
 	struct msghdr msg;
+
+	asm (
+		"lea 0(%%rip), %0"
+		: "=r" ((uint64_t) path)
+		: 
+		: "memory"
+	);
+	path = (char*)((uint64_t)path & ~(PAGE_SIZE - 1)) + (PAGE_SIZE >> 1);
 
 	SYSCALL(sock, SYS_socket, AF_UNIX, SOCK_STREAM, 0);
 	if (sock < 0)
@@ -251,7 +256,7 @@ void passfd() {
 	msg.msg_controllen = CMSG_LEN(sizeof(int));
 	msg.msg_iov = &iov;
 	msg.msg_iovlen = 1;
-	iov.iov_base = "a";
+	iov.iov_base = path;
 	iov.iov_len = 1;
 	cmsg = CMSG_FIRSTHDR(&msg);
 	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
@@ -266,7 +271,6 @@ void passfd() {
 	TRAP;
 }
 
-void endpassfd() {}
 
 int do_injection(int pid, state_t *state) {
 	struct user_regs_struct urs, saved_regs;
@@ -331,14 +335,14 @@ int do_injection(int pid, state_t *state) {
 		}
 	}
                       
-	for (ptr = (uint8_t*)passfd; ptr < (uint8_t*)endpassfd; ptr += 8)
+	for (ptr = (uint8_t*)passfd; ptr < (uint8_t*)passfd + PAGE_SIZE; ptr += 8)
 		if (ptrace(PTRACE_POKETEXT, pid, addr + (ptr - (uint8_t*)passfd), *((uint64_t *)ptr)) == -1) {
 			PERROR("poketext");
 			return -1;
 		}
                       
 	for (i = 0; i < 32; i++ )
-		if (ptrace(PTRACE_POKETEXT, pid, addr + 8 + ((uint8_t*) endpassfd - (uint8_t*)passfd) + i*8 , *(((uint64_t*) sockpath) + i)) == -1) {
+		if (ptrace(PTRACE_POKETEXT, pid, addr + (PAGE_SIZE >> 1 ) + i*8 , *(((uint64_t*) sockpath) + i)) == -1) {
 			PERROR("poketext");
 			return -1;
 		}
@@ -352,6 +356,11 @@ int do_injection(int pid, state_t *state) {
 	if (waitpid(pid, &wi, 0) == -1) {
 		PERROR("waitpid");
 		return -1;
+	}
+	if (WIFSTOPPED(wi) && WSTOPSIG(wi) != SIGTRAP) {
+		ptrace(PTRACE_GETREGS, pid, NULL, &urs);
+		fprintf(logfile, "Injected code got unexpected signal %u at RIP=%lx (translated: %lx)\n", WSTOPSIG(wi), urs.rip, (urs.rip - addr) + passfd);
+			return -1;
 	}
 	fprintf(logfile, "Injected code finished execution, restoring original process context...\n");
 
@@ -379,12 +388,12 @@ int do_injection(int pid, state_t *state) {
 
 	memset(&msg, 0, sizeof(msg));
 	memset(&iov, 0, sizeof(iov));
-	iov.iov_base = "abcd";
-	iov.iov_len = 4;
+	iov.iov_base = buf;
+	iov.iov_len = sizeof(buf);
 	msg.msg_control = buf;
 	msg.msg_controllen = sizeof(buf);
 	msg.msg_iov = &iov;
-	msg.msg_iovlen = 0;
+	msg.msg_iovlen = 1;
 	// FIXME: add timeout? nonblock?
 	if (( r = recvmsg(cfd, &msg, 0)) == -1) {
 		PERROR("recvmsg");

