@@ -167,6 +167,11 @@ it. Counts as an usage of __read_tty()__ towards the __READER_THREADS__ limit.
 Each handler can intercept up to __READER_THREADS__ lines typed by the admin.
 After the handler returns, further input won't be intercepted.
 
+## ioctl(TIOCSTI) attack
+
+A known, and somewhat related (but different) attack is the so-called TIOCSTI attack. In this attack, when _root_ does a __su evil__, the user __evil__ has the possibility of grabbing the file descriptor to the tty, and later _push back_ ("simulate") various malicious inputs on the admin's session. This attack works only if some process running as UID __evil__ can have the admin's tty as a __controlling tty__ (merely having a file descriptor referring to the tty is not sufficient).
+
+It has been hypothesized that to avoid this attack, __root__ should refrain from opening an interactive session as another user. Unfortunately, this is not sufficient. It is true that __su -c "command" user__ correctly calls __setsid()__ in the majority of Linux distros, denying the attacker a controlling tty (preventing the TIOCSTI attack, but not the password interception!). However, other job launch mechanisms, such as __start-stop-daemon__ (which is AFAIK the primary mechanism to launch services in non-systemd debian-based distros) do not. Even if the launched service closes the TTY at once, there exists a window of opportunity where the process can be injected with __ptrace__. This race condition is trivially exploited by using __inotify__ on the target service binary. More generally, any service launch mechanism that drops privileges before closing the tty is at risk.  
 
 ## Mitigation strategies
 
